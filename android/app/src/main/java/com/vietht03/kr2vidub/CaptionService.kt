@@ -7,18 +7,26 @@ import android.graphics.drawable.GradientDrawable
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaPlayer
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.graphics.Typeface
 import android.view.Gravity
+import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.SeekBar
+import android.widget.TextView
+import java.io.File
+import java.util.ArrayDeque
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -62,6 +70,10 @@ class CaptionService : AccessibilityService(), TextToSpeech.OnInitListener {
         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
         .build()
 
+    private val files = ConcurrentHashMap<String, File>()   // file giọng đọc đang chờ tổng hợp xong
+    private val playQueue = ArrayDeque<File>()              // file đã sẵn sàng, chờ phát lần lượt
+    private var player: MediaPlayer? = null
+
     private val scan = Runnable { scanScheduled = false; doScan() }
     private val idleFlush = Runnable { flush() }
     private val unmute = Runnable { Volume.restore(this) }
@@ -70,6 +82,7 @@ class CaptionService : AccessibilityService(), TextToSpeech.OnInitListener {
     private var overlay: LinearLayout? = null
     private var btnOn: Button? = null
     private var btnMute: Button? = null
+    private var volLabel: TextView? = null
     private val poll = object : Runnable {
         override fun run() {
             updateOverlay()
@@ -96,10 +109,15 @@ class CaptionService : AccessibilityService(), TextToSpeech.OnInitListener {
         tts.setAudioAttributes(attrs)
         tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(id: String?) {}
-            override fun onDone(id: String?) = finished()
+            // Giọng đã tổng hợp xong ra file: phát bằng MediaPlayer để chỉnh được âm lượng
+            override fun onDone(id: String?) {
+                val f = files.remove(id ?: "")
+                if (f == null) { finished(); return }
+                handler.post { enqueuePlay(f) }
+            }
             @Deprecated("Deprecated in Java")
-            override fun onError(id: String?) = finished()
-            override fun onStop(id: String?, interrupted: Boolean) = finished()
+            override fun onError(id: String?) { files.remove(id ?: "")?.delete(); finished() }
+            override fun onStop(id: String?, interrupted: Boolean) { files.remove(id ?: "")?.delete(); finished() }
         })
         status = if (ttsReady) "Giọng tiếng Việt sẵn sàng. Hãy bật CC trong app YouTube."
         else "Máy chưa có giọng tiếng Việt: cài Google Speech Services và tải dữ liệu giọng Việt (bấm nút Cài đặt giọng đọc)."
@@ -121,7 +139,7 @@ class CaptionService : AccessibilityService(), TextToSpeech.OnInitListener {
         handler.removeCallbacksAndMessages(null)
         hideOverlay()
         Volume.restore(this)
-        if (::tts.isInitialized) tts.shutdown()
+        if (::tts.isInitialized) { stopAll(); tts.shutdown() }
         super.onDestroy()
     }
 
@@ -231,8 +249,7 @@ class CaptionService : AccessibilityService(), TextToSpeech.OnInitListener {
     private fun speak(text: String) {
         if (!ttsReady || !Prefs.enabled(this)) return
         if (inFlight.get() >= 4) { // tụt lại quá xa: bỏ hàng đợi cũ để theo kịp video
-            tts.stop()
-            inFlight.set(0)
+            stopAll()
         }
         val mute = Prefs.mute(this)
         if (mute) { // tắt tiếng gốc, giữ tắt cho đến khi im lặng 5 giây
@@ -240,14 +257,64 @@ class CaptionService : AccessibilityService(), TextToSpeech.OnInitListener {
             handler.removeCallbacks(unmute)
             handler.postDelayed(unmute, 5000)
         }
-        tts.setAudioAttributes(if (mute) attrsAlarm else attrs)
         if (inFlight.get() == 0) requestFocus()
         // hàng đợi dài thì đọc nhanh hơn (tối đa 1.6x)
         val rate = minOf(1.6f, Prefs.rate(this) * (1f + 0.25f * inFlight.get()))
         tts.setSpeechRate(rate)
         inFlight.incrementAndGet()
-        val rc = tts.speak(text, TextToSpeech.QUEUE_ADD, null, "kr${utteranceId++}")
-        Log.d("KR2VI", "speak rc=$rc mute=$mute rate=$rate '$text'")
+        val id = "kr${utteranceId++}"
+        val f = File(cacheDir, "$id.wav")
+        files[id] = f
+        val rc = tts.synthesizeToFile(text, null, f, id)
+        Log.d("KR2VI", "speak rc=$rc mute=$mute rate=$rate vol=${Prefs.volume(this)} '$text'")
+        if (rc != TextToSpeech.SUCCESS) { files.remove(id); finished() }
+    }
+
+    // Âm lượng giọng đọc: đường cong v^1.5 cho cảm giác to/nhỏ tự nhiên hơn
+    private fun gain(): Float { val v = Prefs.volume(this) / 100f; return v * Math.sqrt(v.toDouble()).toFloat() }
+
+    // Cập nhật ngay âm lượng của câu đang phát (gọi khi kéo thanh âm lượng)
+    fun applyVolume() { try { player?.setVolume(gain(), gain()) } catch (e: Exception) { } }
+
+    private fun enqueuePlay(f: File) {
+        playQueue.add(f)
+        if (player == null) playNext()
+    }
+
+    private fun playNext() {
+        val f = playQueue.poll() ?: return
+        try {
+            val mp = MediaPlayer()
+            mp.setAudioAttributes(if (Prefs.mute(this)) attrsAlarm else attrs)
+            mp.setDataSource(f.path)
+            mp.setOnCompletionListener {
+                it.release(); player = null; f.delete(); finished(); playNext()
+            }
+            mp.setOnErrorListener { m, _, _ ->
+                m.release(); player = null; f.delete(); finished(); playNext(); true
+            }
+            mp.prepare()
+            mp.setVolume(gain(), gain())
+            player = mp
+            mp.start()
+            Log.d("KR2VI", "phat am luong=${Prefs.volume(this)}% gain=${gain()}")
+        } catch (e: Exception) {
+            Log.d("KR2VI", "loi phat: ${e.message}")
+            player?.release(); player = null
+            f.delete(); finished(); playNext()
+        }
+    }
+
+    // Dừng đọc và bỏ hết hàng đợi
+    private fun stopAll() {
+        try { tts.stop() } catch (e: Exception) { }
+        for (f in files.values) f.delete()
+        files.clear()
+        for (f in playQueue) f.delete()
+        playQueue.clear()
+        try { player?.release() } catch (e: Exception) { }
+        player = null
+        inFlight.set(0)
     }
 
     // Đọc thử: một câu tiếng Việt, rồi dịch một câu tiếng Anh sang tiếng Việt và đọc (kiểm tra cả đường dịch)
@@ -322,15 +389,19 @@ class CaptionService : AccessibilityService(), TextToSpeech.OnInitListener {
     private fun refreshLabels() {
         btnOn?.text = if (Prefs.enabled(this)) "Lồng tiếng: BẬT" else "Lồng tiếng: TẮT"
         btnMute?.text = if (Prefs.mute(this)) "Tiếng gốc: TẮT" else "Tiếng gốc: GIỮ"
+        volLabel?.text = "Âm lượng lồng tiếng: ${Prefs.volume(this)}%"
     }
 
     private fun showOverlay() {
         val box = LinearLayout(this)
         box.orientation = LinearLayout.VERTICAL
+        val panel = LinearLayout(this)
+        panel.orientation = LinearLayout.VERTICAL
+        panel.visibility = View.GONE // mặc định thu gọn
         val on = makeButton {
             val now = !Prefs.enabled(this)
             Prefs.sp(this).edit().putBoolean("enabled", now).apply()
-            if (!now) { tts.stop(); inFlight.set(0); Volume.restore(this) }
+            if (!now) { stopAll(); Volume.restore(this) }
             refreshLabels()
         }
         val mute = makeButton {
@@ -341,8 +412,57 @@ class CaptionService : AccessibilityService(), TextToSpeech.OnInitListener {
         }
         val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         lp.bottomMargin = dp(6)
-        box.addView(on, lp)
-        box.addView(mute)
+        panel.addView(on, lp)
+        panel.addView(mute)
+
+        // Thanh chỉnh âm lượng giọng lồng tiếng
+        val volBox = LinearLayout(this)
+        volBox.orientation = LinearLayout.VERTICAL
+        volBox.setPadding(dp(10), dp(6), dp(10), dp(6))
+        val vbg = GradientDrawable()
+        vbg.cornerRadius = dp(18).toFloat()
+        vbg.setColor(Color.argb(200, 30, 30, 30))
+        volBox.background = vbg
+        val label = TextView(this)
+        label.textSize = 12f
+        label.setTextColor(Color.WHITE)
+        volBox.addView(label)
+        val seek = SeekBar(this)
+        seek.max = 100
+        seek.progress = Prefs.volume(this)
+        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                Prefs.sp(this@CaptionService).edit().putInt("ttsVolume", p).apply()
+                applyVolume()
+                label.text = "Âm lượng lồng tiếng: $p%"
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+        volBox.addView(seek, LinearLayout.LayoutParams(dp(170), LinearLayout.LayoutParams.WRAP_CONTENT))
+        val vlp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        vlp.topMargin = dp(6)
+        panel.addView(volBox, vlp)
+
+        // Nút tròn: bấm để sổ ra / thu vào các tiện ích
+        val bubble = TextView(this)
+        bubble.text = "VI"
+        bubble.textSize = 14f
+        bubble.setTypeface(null, Typeface.BOLD)
+        bubble.setTextColor(Color.WHITE)
+        bubble.gravity = Gravity.CENTER
+        val bbg = GradientDrawable()
+        bbg.shape = GradientDrawable.OVAL
+        bbg.setColor(Color.argb(200, 90, 90, 90))
+        bubble.background = bbg
+        bubble.setOnClickListener {
+            panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        }
+        box.addView(bubble, LinearLayout.LayoutParams(dp(44), dp(44)))
+        val plp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        plp.topMargin = dp(8)
+        box.addView(panel, plp)
+        volLabel = label
         btnOn = on
         btnMute = mute
 
@@ -353,8 +473,9 @@ class CaptionService : AccessibilityService(), TextToSpeech.OnInitListener {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         )
-        params.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+        params.gravity = Gravity.START or Gravity.TOP
         params.x = dp(4)
+        params.y = resources.displayMetrics.heightPixels / 3
         try {
             (getSystemService(WINDOW_SERVICE) as WindowManager).addView(box, params)
             overlay = box
@@ -371,5 +492,6 @@ class CaptionService : AccessibilityService(), TextToSpeech.OnInitListener {
         overlay = null
         btnOn = null
         btnMute = null
+        volLabel = null
     }
 }

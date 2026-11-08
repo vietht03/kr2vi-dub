@@ -125,6 +125,24 @@ class MainActivity : Activity() {
         })
         root.addView(seek)
 
+        val volLabel = TextView(this)
+        volLabel.setPadding(0, dp(12), 0, 0)
+        root.addView(volLabel)
+        val volSeek = SeekBar(this)
+        volSeek.max = 100
+        volSeek.progress = Prefs.volume(this)
+        volLabel.text = "Âm lượng giọng lồng tiếng: ${volSeek.progress}%"
+        volSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                volLabel.text = "Âm lượng giọng lồng tiếng: $p%"
+                Prefs.sp(this@MainActivity).edit().putInt("ttsVolume", p).apply()
+                CaptionService.instance?.applyVolume()
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+        root.addView(volSeek)
+
         val dbg = Switch(this)
         dbg.text = "Chế độ chẩn đoán (ghi cấu trúc màn hình YouTube)"
         dbg.isChecked = Prefs.debug(this)
