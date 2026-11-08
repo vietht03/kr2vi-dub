@@ -18,7 +18,9 @@
     lastSpoken: -1, speakingIdx: -1, interrupted: -1, curUtter: null,
     ducked: false, savedVol: 1, expectVol: 1, restoreTimer: null,
     saveTimer: null, toastTimer: null,
-    audio: new Map(), audioPending: 0, spokeOnce: false
+    audio: new Map(), audioPending: 0, spokeOnce: false,
+    // chế độ "đọc phụ đề đang hiển thị"
+    rq: [], reading: false, capText: '', capSpoken: '', capTimer: null, capObs: null
   };
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -297,10 +299,14 @@
   }
 
   function stopAudio() {
-    if (S.curUtter && S.curUtter.audio) S.curUtter.audio.pause();
+    const u = S.curUtter;
+    if (!u) return;
+    if (u.audio) u.audio.pause();
+    if (u.finish) u.finish(); // chế độ đọc phụ đề: giải phóng hàng đợi
   }
 
   function cancelSpeech() {
+    S.rq.length = 0;
     stopAudio();
     S.curUtter = null;
     S.speakingIdx = -1;
@@ -372,6 +378,127 @@
     }
   }
 
+  // ----- Chế độ "đọc phụ đề đang hiển thị" (bật CC trên YouTube, tool dịch + đọc) -----
+  function playText(text, rate) {
+    return new Promise((resolve) => {
+      const u = { audio: null };
+      const done = () => {
+        if (S.curUtter === u) { S.curUtter = null; S.speakingIdx = -1; scheduleRestore(); }
+        resolve();
+      };
+      u.finish = done;
+      S.curUtter = u;
+      S.speakingIdx = -2;
+      duck();
+      const voice = pickVoice();
+      if (voice) {
+        const ut = new SpeechSynthesisUtterance(text);
+        ut.lang = 'vi-VN'; ut.voice = voice; ut.rate = rate;
+        ut.onend = done; ut.onerror = done;
+        speechSynthesis.speak(ut);
+        return;
+      }
+      chrome.runtime.sendMessage({ type: 'tts', text: text.slice(0, 200) }).then((res) => {
+        if (S.curUtter !== u) return resolve(); // đã bị ngắt
+        if (!res || !res.ok) throw new Error(res ? res.error : 'Service worker không phản hồi');
+        const bin = atob(res.b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+        const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+        const a = new Audio(url);
+        a.playbackRate = rate;
+        a.onended = a.onerror = () => { URL.revokeObjectURL(url); done(); };
+        u.audio = a;
+        return a.play();
+      }).catch((e) => {
+        done();
+        if (Date.now() - S.lastErrToast > 10000) {
+          S.lastErrToast = Date.now();
+          toast('Lỗi giọng đọc: ' + e.message, 6000, true);
+        }
+      });
+    });
+  }
+
+  async function runReader() {
+    if (S.reading) return;
+    S.reading = true;
+    try {
+      while (S.enabled && S.settings.mode === 'read' && S.rq.length) {
+        const t = S.rq.shift();
+        // hàng đợi dài thì đọc nhanh hơn để theo kịp video
+        const rate = Math.min(Math.max(S.settings.rate, MAX_RATE), S.settings.rate * (1 + 0.25 * S.rq.length));
+        await playText(t, rate);
+      }
+    } finally { S.reading = false; }
+  }
+
+  // Chỉ lấy phần chữ mới (phụ đề tự động cuộn: dòng cũ lặp lại trong cửa sổ mới)
+  function newPart(prev, cur) {
+    const a = prev.split(' ').filter(Boolean), b = cur.split(' ').filter(Boolean);
+    for (let k = Math.min(a.length, b.length); k > 0; k--) {
+      if (a.slice(a.length - k).join(' ') === b.slice(0, k).join(' ')) return b.slice(k).join(' ');
+    }
+    return cur;
+  }
+
+  async function handleCaption(T) {
+    const fresh = newPart(S.capSpoken, T).trim();
+    S.capSpoken = T;
+    if (!fresh || !S.enabled) return;
+    const token = S.loadToken;
+    try {
+      const res = await chrome.runtime.sendMessage({ type: 'translate', texts: [fresh] });
+      if (token !== S.loadToken) return;
+      if (!res || !res.ok) throw new Error(res ? res.error : 'Service worker không phản hồi');
+      const vi = (res.translations[0] || '').trim();
+      if (!vi) return;
+      S.rq.push(vi);
+      if (S.rq.length > 3) S.rq.splice(0, S.rq.length - 3); // bỏ câu cũ nếu tụt lại quá xa
+      runReader();
+    } catch (e) {
+      if (Date.now() - S.lastErrToast > 10000) {
+        S.lastErrToast = Date.now();
+        toast('Lỗi dịch: ' + e.message, 6000, true);
+      }
+    }
+  }
+
+  function readCaptions() {
+    if (!S.enabled || S.settings.mode !== 'read') return;
+    const T = [...document.querySelectorAll('.ytp-caption-segment')]
+      .map((e) => e.textContent).join(' ').replace(/\s+/g, ' ').trim();
+    if (T === S.capText) return;
+    S.capText = T;
+    clearTimeout(S.capTimer);
+    if (!T) { S.capSpoken = ''; return; }
+    S.capTimer = setTimeout(() => handleCaption(T), 600); // đợi chữ ổn định rồi mới đọc
+  }
+
+  function readTick() {
+    const v = S.video;
+    if (!S.enabled || !v) return;
+    const player = document.getElementById('movie_player');
+    if (player && player.classList.contains('ad-showing')) { cancelSpeech(); restoreNow(); return; }
+    if (v.paused) return;
+    if (S.settings.muteOrig && !S.ducked) duck();
+    else if (!S.settings.muteOrig && S.ducked && S.speakingIdx === -1) restoreNow();
+  }
+
+  function enableRead() {
+    S.rq.length = 0; S.capText = ''; S.capSpoken = '';
+    clearInterval(S.ticker);
+    S.ticker = setInterval(readTick, 200);
+    const p = document.getElementById('movie_player');
+    if (S.capObs) S.capObs.disconnect();
+    S.capObs = new MutationObserver(readCaptions);
+    if (p) S.capObs.observe(p, { childList: true, subtree: true, characterData: true });
+    const btn = document.querySelector('.ytp-subtitles-button'); // tự bật CC nếu đang tắt
+    if (btn && btn.getAttribute('aria-pressed') === 'false') btn.click();
+    toast('Đọc phụ đề đang hiển thị — nếu chưa thấy chữ, hãy bật CC trên YouTube', 4500);
+    readCaptions();
+  }
+
   function speak(i, avail) {
     const text = S.tr[i];
     if (!text) return;
@@ -441,6 +568,7 @@
     seeking() {
       if (!S.enabled) return;
       cancelSpeech(); restoreNow();
+      S.capSpoken = '';
       S.interrupted = -1; S.lastSpoken = -1; // sau khi tua sẽ đọc lại từ câu tại vị trí mới
     },
     ended() { if (S.enabled) { cancelSpeech(); restoreNow(); showSub(''); } },
@@ -469,7 +597,8 @@
     S.videoId = vid;
     const token = ++S.loadToken;
     updateButton();
-    toast('Đang tải phụ đề tiếng Hàn…', 0);
+    if (S.settings.mode === 'read') { enableRead(); return; }
+    toast('Đang tải phụ đề…', 0);
     try {
       const cues = await loadCues(vid);
       if (token !== S.loadToken) return;
@@ -499,6 +628,8 @@
     S.loadToken++;
     clearInterval(S.ticker);
     S.ticker = null;
+    if (S.capObs) { S.capObs.disconnect(); S.capObs = null; }
+    clearTimeout(S.capTimer);
     saveCache();
     cancelSpeech();
     clearAudio();

@@ -43,6 +43,8 @@ $('toggle').onclick = async () => { renderToggle(await sendToTab('toggle')); };
   $('rate').value = s.rate;
   $('duck').value = s.duck;
   $('showSubs').checked = s.showSubs;
+  $('mode').value = s.mode;
+  $('mode').onchange = () => kr2viSaveSettings({ mode: $('mode').value });
   $('srcLang').value = s.srcLang;
   $('srcLang').onchange = () => kr2viSaveSettings({ srcLang: $('srcLang').value });
   $('muteOrig').checked = s.muteOrig;
