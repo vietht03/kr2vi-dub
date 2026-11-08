@@ -1,8 +1,9 @@
 // Cài đặt mặc định + hàm đọc/ghi dùng chung (content script, popup, options, service worker)
 const KR2VI_DEFAULTS = {
-  rate: 1.0,            // tốc độ đọc cơ bản
+  rate: 1.0,            // tốc độ đọc cơ bản (0.6 – 2.0)
+  autoCatchUp: false,   // tự đọc nhanh hơn (tối đa 2x) khi không theo kịp phụ đề
   duck: 0.18,           // hệ số âm lượng video gốc khi đang đọc (18%)
-  mode: 'dub',          // dub = dịch trước theo phụ đề video | read = đọc phụ đề đang hiển thị
+  mode: 'read',         // read = đọc đúng phụ đề YouTube đang hiển thị | dub = tự dịch trước theo phụ đề video
   srcLang: 'auto',     // ngôn ngữ phụ đề nguồn: auto | ko | ja | zh | en
   muteOrig: true,    // tắt hẳn âm thanh gốc khi đang lồng tiếng
   voice: '',          // voiceURI giọng Việt ('' = tự chọn)

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "KR2VI Dub",
-  "version": "1.4.0",
+  "version": "1.6.0",
   "description": "Xem video YouTube tiếng Hàn với giọng lồng tiếng Việt (phụ đề Hàn → dịch → đọc bằng Web Speech API).",
   "minimum_chrome_version": "111",
   "permissions": ["storage"],

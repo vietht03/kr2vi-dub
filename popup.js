@@ -47,6 +47,8 @@ $('toggle').onclick = async () => { renderToggle(await sendToTab('toggle')); };
   $('mode').onchange = () => kr2viSaveSettings({ mode: $('mode').value });
   $('srcLang').value = s.srcLang;
   $('srcLang').onchange = () => kr2viSaveSettings({ srcLang: $('srcLang').value });
+  $('catchUp').checked = s.autoCatchUp;
+  $('catchUp').onchange = () => kr2viSaveSettings({ autoCatchUp: $('catchUp').checked });
   $('muteOrig').checked = s.muteOrig;
   $('muteOrig').onchange = () => kr2viSaveSettings({ muteOrig: $('muteOrig').checked });
   showVals();

@@ -6,7 +6,10 @@
   const PREFETCH_AHEAD = 30;   // dịch trước 30 giây
   const BATCH_MAX = 25;        // số câu tối đa mỗi lần gọi dịch
   const CHARS_PER_SEC = 14;    // ước lượng tốc độ đọc tiếng Việt ở rate 1.0
-  const MAX_RATE = 1.5;        // tốc độ đọc tối đa khi tăng tốc cho khớp thời gian
+  const MAX_QUEUE_WORDS = 22;  // số từ tối đa đang chờ đọc (≈ 8 giây ở 1x)
+  const CATCHUP_RATE = 2.0;    // trần tốc độ khi bật "tự đọc nhanh hơn khi không theo kịp"
+  // Trần tốc độ tự tăng: mặc định không tự đọc nhanh hơn tốc độ người dùng chọn
+  const maxRate = () => (S.settings.autoCatchUp ? CATCHUP_RATE : 0);
   const CACHE_VIDEOS = 20;     // số video giữ trong cache
 
   const S = {
@@ -20,7 +23,7 @@
     saveTimer: null, toastTimer: null,
     audio: new Map(), audioPending: 0, spokeOnce: false,
     // chế độ "đọc phụ đề đang hiển thị"
-    rq: [], reading: false, capText: '', capSpoken: '', capTimer: null, capObs: null
+    rq: [], reading: false, capText: '', capTimer: null, capObs: null, chain: Promise.resolve(), rAudio: new Map()
   };
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -273,7 +276,7 @@
   function calcRate(i, avail) {
     const base = S.settings.rate;
     const need = S.cues[i].text ? S.tr[i].length / CHARS_PER_SEC / (avail / (S.video.playbackRate || 1)) : 0;
-    const cap = Math.max(base, MAX_RATE); // tăng tốc tối đa 1.5x (không thấp hơn tốc độ người dùng chọn)
+    const cap = Math.max(base, maxRate()); // không tự đọc nhanh hơn tốc độ người dùng chọn (trừ khi bật tự tăng tốc)
     return Math.min(Math.max(base, need), cap);
   }
 
@@ -306,7 +309,7 @@
   }
 
   function cancelSpeech() {
-    S.rq.length = 0;
+    S.rq.splice(0).forEach(dropAudio);
     stopAudio();
     S.curUtter = null;
     S.speakingIdx = -1;
@@ -379,6 +382,27 @@
   }
 
   // ----- Chế độ "đọc phụ đề đang hiển thị" (bật CC trên YouTube, tool dịch + đọc) -----
+  // Tải âm thanh giọng online (có nhớ theo nội dung) để cụm sau được tải sẵn khi cụm trước còn đang phát
+  function fetchAudio(text) {
+    let p = S.rAudio.get(text);
+    if (!p) {
+      p = chrome.runtime.sendMessage({ type: 'tts', text: text.slice(0, 200) }).then((res) => {
+        if (!res || !res.ok) throw new Error(res ? res.error : 'Service worker không phản hồi');
+        const bin = atob(res.b64), bytes = new Uint8Array(bin.length);
+        for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+        return URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+      });
+      S.rAudio.set(text, p);
+      p.catch(() => S.rAudio.delete(text));
+    }
+    return p;
+  }
+  function dropAudio(text) {
+    const p = S.rAudio.get(text);
+    S.rAudio.delete(text);
+    if (p) p.then((u) => URL.revokeObjectURL(u)).catch(() => {});
+  }
+
   function playText(text, rate) {
     return new Promise((resolve) => {
       const u = { audio: null };
@@ -394,24 +418,22 @@
       if (voice) {
         const ut = new SpeechSynthesisUtterance(text);
         ut.lang = 'vi-VN'; ut.voice = voice; ut.rate = rate;
+        ut.onstart = () => logSpoken('▶');
         ut.onend = done; ut.onerror = done;
         speechSynthesis.speak(ut);
         return;
       }
-      chrome.runtime.sendMessage({ type: 'tts', text: text.slice(0, 200) }).then((res) => {
-        if (S.curUtter !== u) return resolve(); // đã bị ngắt
-        if (!res || !res.ok) throw new Error(res ? res.error : 'Service worker không phản hồi');
-        const bin = atob(res.b64);
-        const bytes = new Uint8Array(bin.length);
-        for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
-        const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+      fetchAudio(text).then((url) => {
+        S.rAudio.delete(text);
+        if (S.curUtter !== u) { URL.revokeObjectURL(url); return resolve(); } // đã bị ngắt
         const a = new Audio(url);
         a.playbackRate = rate;
         a.onended = a.onerror = () => { URL.revokeObjectURL(url); done(); };
         u.audio = a;
-        return a.play();
+        return a.play().then(() => logSpoken('▶'));
       }).catch((e) => {
         done();
+        logSpoken('!LỖI GIỌNG ' + e.message);
         if (Date.now() - S.lastErrToast > 10000) {
           S.lastErrToast = Date.now();
           toast('Lỗi giọng đọc: ' + e.message, 6000, true);
@@ -426,42 +448,91 @@
     try {
       while (S.enabled && S.settings.mode === 'read' && S.rq.length) {
         const t = S.rq.shift();
-        // hàng đợi dài thì đọc nhanh hơn để theo kịp video
-        const rate = Math.min(Math.max(S.settings.rate, MAX_RATE), S.settings.rate * (1 + 0.25 * S.rq.length));
+        logSpoken(t);
+        // Khi bật "tự đọc nhanh hơn": số từ đang chờ càng nhiều (kể cả cụm sắp đọc) thì đọc càng nhanh, tối đa CATCHUP_RATE.
+        // Mặc định tắt: maxRate() = 0 nên luôn đọc đúng tốc độ người dùng chọn.
+        const waiting = S.rq.reduce((n, x) => n + x.split(' ').length, t.split(' ').length);
+        const rate = Math.min(Math.max(S.settings.rate, maxRate()), S.settings.rate * Math.max(1, waiting / 12));
         await playText(t, rate);
       }
     } finally { S.reading = false; }
   }
 
-  // Chỉ lấy phần chữ mới (phụ đề tự động cuộn: dòng cũ lặp lại trong cửa sổ mới)
+  // ----- Gom chữ phụ đề YouTube đang hiện thành cụm rồi đọc -----
+  // YouTube cập nhật chữ TỪNG TỪ MỘT (và dòng cũ cuộn đi), nên không thể đợi chữ "đứng yên" mới đọc.
+  const normWord = (w) => w.trim().replace(/[.,!?;:…]+$/, '').toLowerCase();
+
+  // Chỉ lấy phần chữ mới: bỏ phần đầu của `cur` trùng với đuôi của `prev` (so khớp bỏ qua dấu câu cuối từ)
   function newPart(prev, cur) {
     const a = prev.split(' ').filter(Boolean), b = cur.split(' ').filter(Boolean);
     for (let k = Math.min(a.length, b.length); k > 0; k--) {
-      if (a.slice(a.length - k).join(' ') === b.slice(0, k).join(' ')) return b.slice(k).join(' ');
+      let same = true;
+      for (let i = 0; i < k; i++) if (normWord(a[a.length - k + i]) !== normWord(b[i])) { same = false; break; }
+      if (same) return b.slice(k).join(' ');
     }
     return cur;
   }
 
-  async function handleCaption(T) {
-    const fresh = newPart(S.capSpoken, T).trim();
-    S.capSpoken = T;
-    if (!fresh || !S.enabled) return;
-    const token = S.loadToken;
+  // Phụ đề đã là tiếng Việt (ví dụ YouTube tự dịch) thì đọc nguyên văn, không dịch lại
+  const VI_CHARS = /[ăâđêôơưàáạảãầấậẩẫằắặẳẵèéẹẻẽềếệểễìíịỉĩòóọỏõồốộổỗờớợởỡùúụủũừứựửữỳýỵỷỹ]/i;
+  const CJK_CHARS = /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/;
+  const looksVietnamese = (t) => !CJK_CHARS.test(t) && VI_CHARS.test(t);
+
+  // Ghi nhật ký những gì đã đọc (chỉ khi trang có thuộc tính data-kr2vi-test, dùng cho kiểm thử tự động)
+  function logSpoken(t) {
+    const root = document.documentElement;
+    if (!root.hasAttribute('data-kr2vi-test')) return;
     try {
-      const res = await chrome.runtime.sendMessage({ type: 'translate', texts: [fresh] });
-      if (token !== S.loadToken) return;
-      if (!res || !res.ok) throw new Error(res ? res.error : 'Service worker không phản hồi');
-      const vi = (res.translations[0] || '').trim();
-      if (!vi) return;
-      S.rq.push(vi);
-      if (S.rq.length > 3) S.rq.splice(0, S.rq.length - 3); // bỏ câu cũ nếu tụt lại quá xa
-      runReader();
-    } catch (e) {
-      if (Date.now() - S.lastErrToast > 10000) {
-        S.lastErrToast = Date.now();
-        toast('Lỗi dịch: ' + e.message, 6000, true);
+      const a = JSON.parse(root.dataset.kr2viLog || '[]'), ts = JSON.parse(root.dataset.kr2viLogT || '[]');
+      a.push(t); ts.push(Date.now());
+      root.dataset.kr2viLog = JSON.stringify(a.slice(-300));
+      root.dataset.kr2viLogT = JSON.stringify(ts.slice(-300));
+    } catch (e) { /* bỏ qua */ }
+  }
+
+  let capBuf = ''; // các từ mới chưa đọc
+
+  function flushCaption() {
+    clearTimeout(S.capTimer);
+    const text = capBuf.trim();
+    capBuf = '';
+    if (!/[\p{L}\p{N}]/u.test(text)) return; // bỏ cụm chỉ có dấu câu
+    // Xử lý lần lượt để giữ đúng thứ tự câu dù có câu phải chờ dịch
+    S.chain = S.chain.then(() => handleChunk(text)).catch(() => {});
+  }
+
+  async function handleChunk(text) {
+    if (!S.enabled || S.settings.mode !== 'read') return;
+    const token = S.loadToken;
+    let vi = text;
+    if (!looksVietnamese(text)) {
+      try {
+        const res = await chrome.runtime.sendMessage({ type: 'translate', texts: [text] });
+        if (token !== S.loadToken) return;
+        if (!res || !res.ok) throw new Error(res ? res.error : 'Service worker không phản hồi');
+        vi = (res.translations[0] || '').trim();
+      } catch (e) {
+        logSpoken('!LỖI DỊCH ' + e.message);
+        if (Date.now() - S.lastErrToast > 10000) {
+          S.lastErrToast = Date.now();
+          toast('Lỗi dịch: ' + e.message, 6000, true);
+        }
+        return;
       }
     }
+    if (!vi || token !== S.loadToken) return;
+    // Đang có cụm chờ (tức là đã tụt lại): gộp vào cụm chờ cuối để đọc liền một lần, bớt khoảng nghỉ giữa các file âm thanh
+    if (S.rq.length >= 1 && !pickVoice() && (S.rq[S.rq.length - 1] + ' ' + vi).length <= 190) {
+      const prev = S.rq.pop();
+      dropAudio(prev);
+      vi = prev + ' ' + vi;
+    }
+    S.rq.push(vi);
+    if (!pickVoice()) fetchAudio(vi).catch(() => {}); // giọng online: tải trước khi đến lượt
+    // Giữ độ trễ không quá ~8 giây (số từ chờ tối đa tỉ lệ theo tốc độ đọc): quá mức đó thì bỏ câu cũ nhất để không lệch hẳn với video
+    const wc = (t) => t.split(' ').length;
+    while (S.rq.length > 1 && S.rq.reduce((n, t) => n + wc(t), 0) > MAX_QUEUE_WORDS * Math.max(1, S.settings.rate)) dropAudio(S.rq.shift());
+    runReader();
   }
 
   function readCaptions() {
@@ -469,10 +540,15 @@
     const T = [...document.querySelectorAll('.ytp-caption-segment')]
       .map((e) => e.textContent).join(' ').replace(/\s+/g, ' ').trim();
     if (T === S.capText) return;
+    const prev = S.capText;
     S.capText = T;
     clearTimeout(S.capTimer);
-    if (!T) { S.capSpoken = ''; return; }
-    S.capTimer = setTimeout(() => handleCaption(T), 600); // đợi chữ ổn định rồi mới đọc
+    if (!T) { flushCaption(); return; } // phụ đề biến mất: đọc nốt phần còn lại
+    const fresh = newPart(prev, T);
+    if (fresh) capBuf = (capBuf + ' ' + fresh).trim();
+    const words = capBuf ? capBuf.split(' ').length : 0, last = capBuf.slice(-1);
+    if ('.!?…。！？'.includes(last) || (',;:'.includes(last) && words >= 7) || words >= 14) flushCaption();
+    else if (capBuf) S.capTimer = setTimeout(flushCaption, 1000); // chữ ngừng đổi 1 giây thì đọc nốt (đủ dài để không cắt giữa câu)
   }
 
   function readTick() {
@@ -486,7 +562,7 @@
   }
 
   function enableRead() {
-    S.rq.length = 0; S.capText = ''; S.capSpoken = '';
+    S.rq.length = 0; S.capText = ''; capBuf = '';
     clearInterval(S.ticker);
     S.ticker = setInterval(readTick, 200);
     const p = document.getElementById('movie_player');
@@ -568,7 +644,7 @@
     seeking() {
       if (!S.enabled) return;
       cancelSpeech(); restoreNow();
-      S.capSpoken = '';
+      S.capText = ''; capBuf = '';
       S.interrupted = -1; S.lastSpoken = -1; // sau khi tua sẽ đọc lại từ câu tại vị trí mới
     },
     ended() { if (S.enabled) { cancelSpeech(); restoreNow(); showSub(''); } },
