@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <title>KR2VI Dub</title>
+  <style>
+    body { width: 290px; margin: 0; padding: 12px; font: 13px system-ui, sans-serif; }
+    h1 { font-size: 15px; margin: 0 0 10px; }
+    label { display: block; margin-top: 10px; }
+    input[type=range], select { width: 100%; }
+    .val { float: right; color: #555; }
+    .check { display: flex; align-items: center; gap: 6px; }
+    .note { margin-top: 8px; color: #b00020; display: none; }
+    a { display: inline-block; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>KR2VI Dub</h1>
+
+  <button id="toggle" style="width:100%;padding:8px;font-size:14px;cursor:pointer">Bật lồng tiếng Việt</button>
+  <div id="toggleNote" style="margin-top:6px;color:#b00020;display:none"></div>
+
+  <label>Tốc độ đọc <span class="val" id="rateVal"></span>
+    <input type="range" id="rate" min="0.6" max="1.5" step="0.05">
+  </label>
+
+  <label>Âm lượng video gốc khi đọc <span class="val" id="duckVal"></span>
+    <input type="range" id="duck" min="0.05" max="0.5" step="0.01">
+  </label>
+
+  <label>Ngôn ngữ phụ đề nguồn
+    <select id="srcLang">
+      <option value="auto">Tự động (Hàn → Nhật → Trung → Anh)</option>
+      <option value="ko">Tiếng Hàn</option>
+      <option value="ja">Tiếng Nhật</option>
+      <option value="zh">Tiếng Trung</option>
+      <option value="en">Tiếng Anh</option>
+    </select>
+  </label>
+  <div style="color:#666;font-size:11px">Áp dụng khi bật lồng tiếng (tắt rồi bật lại video đang xem).</div>
+
+  <label class="check"><input type="checkbox" id="muteOrig"> Tắt hẳn âm thanh gốc (chỉ nghe lồng tiếng)</label>
+
+  <label>Giọng tiếng Việt
+    <select id="voice"></select>
+  </label>
+  <div class="note" id="noVoice">Không tìm thấy giọng vi-VN trên máy này.</div>
+
+  <label class="check"><input type="checkbox" id="showSubs"> Hiện phụ đề tiếng Việt trên màn hình</label>
+
+  <a href="#" id="opt">Cài đặt dịch / API key…</a>
+
+  <script src="shared.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

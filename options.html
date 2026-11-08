@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <title>KR2VI Dub – Cài đặt</title>
+  <style>
+    body { max-width: 560px; margin: 24px auto; font: 14px system-ui, sans-serif; padding: 0 12px; }
+    label { display: block; margin-top: 12px; }
+    input[type=text], input[type=password], select { width: 100%; padding: 6px; box-sizing: border-box; }
+    button { margin: 14px 8px 0 0; padding: 7px 14px; }
+    #status { margin-top: 12px; min-height: 1.4em; }
+    .ok { color: #0a7d2c; } .err { color: #b00020; }
+    fieldset { margin-top: 16px; }
+    small { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>KR2VI Dub – Cài đặt dịch</h1>
+
+  <label>Dịch vụ dịch
+    <select id="provider">
+      <option value="free">Miễn phí (Google Translate, không cần key)</option>
+      <option value="gemini">Gemini API</option>
+      <option value="openai">OpenAI API</option>
+    </select>
+  </label>
+
+  <fieldset>
+    <legend>Gemini</legend>
+    <label>API key <input type="password" id="geminiKey" autocomplete="off"></label>
+    <label>Model <input type="text" id="geminiModel"></label>
+  </fieldset>
+
+  <fieldset>
+    <legend>OpenAI</legend>
+    <label>API key <input type="password" id="openaiKey" autocomplete="off"></label>
+    <label>Model <input type="text" id="openaiModel"></label>
+  </fieldset>
+
+  <small>Key chỉ được lưu trong bộ nhớ cục bộ của trình duyệt (chrome.storage.local), không đồng bộ lên đám mây.</small>
+
+  <div>
+    <button id="save">Lưu</button>
+    <button id="test">Thử dịch “안녕하세요”</button>
+    <button id="clear">Xoá cache bản dịch</button>
+  </div>
+  <div id="status"></div>
+
+  <script src="shared.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>
