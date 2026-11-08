@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">KR2VI Dub</string>
+    <string name="service_description">Chỉ đọc chữ phụ đề trong ứng dụng YouTube để dịch sang tiếng Việt và đọc thành tiếng. Không thu thập hay lưu dữ liệu nào khác.</string>
+</resources>
